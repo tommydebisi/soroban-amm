@@ -34,6 +34,7 @@ pub enum DataKey {
 // ── Pool info returned by `get_info` ─────────────────────────────────────────
 
 #[contracttype]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PoolInfo {
     pub token_a: Address,
     pub token_b: Address,
@@ -66,7 +67,7 @@ impl AmmPool {
             panic!("already initialized");
         }
         assert!(token_a != token_b, "tokens must differ");
-        assert!(fee_bps >= 0 && fee_bps <= 10_000, "invalid fee");
+        assert!((0..=10_000).contains(&fee_bps), "invalid fee");
 
         env.storage().instance().set(&DataKey::TokenA, &token_a);
         env.storage().instance().set(&DataKey::TokenB, &token_b);
@@ -394,7 +395,7 @@ mod tests {
             &7u32,
         );
 
-        (env, admin, amm_addr, lp_addr, admin)
+        (env, admin.clone(), amm_addr, lp_addr, admin)
     }
 
     #[test]

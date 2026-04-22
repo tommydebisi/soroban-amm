@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Build WASM
+        run: cargo build --release --target wasm32-unknown-unknown
+
+      - name: Check WASM Binary Size
+        run: |
+          AMM_SIZE=$(wc -c < target/wasm32-unknown-unknown/release/amm.wasm)
+          TOKEN_SIZE=$(wc -c < target/wasm32-unknown-unknown/release/token.wasm)
+          MAX_SIZE=102400  # 100 KB threshold
+
+          echo "AMM WASM size: $AMM_SIZE bytes"
+          echo "TOKEN WASM size: $TOKEN_SIZE bytes"
+
+          if [ "$AMM_SIZE" -gt "$MAX_SIZE" ]; then
+            echo "amm.wasm exceeds size limit: ${AMM_SIZE} bytes (limit: ${MAX_SIZE})"
+            exit 1
+          fi
+
+          if [ "$TOKEN_SIZE" -gt "$MAX_SIZE" ]; then
+            echo "token.wasm exceeds size limit: ${TOKEN_SIZE} bytes (limit: ${MAX_SIZE})"
+            exit 1
+          fi

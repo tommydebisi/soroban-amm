@@ -14,8 +14,24 @@ use soroban_sdk::{
 };
 // Standard SEP-41 interface for pool tokens (token_a, token_b)
 use soroban_sdk::token::Client as SepTokenClient;
-// Our custom LP token client (has mint + burn)
-use token::LpTokenClient;
+
+/// Interface for the LP token contract.
+///
+/// We define this locally rather than importing the `token` crate to avoid
+/// duplicate symbol errors during the WASM build.
+#[soroban_sdk::contractclient(name = "LpTokenClient")]
+pub trait LpTokenInterface {
+    fn initialize(
+        env: Env,
+        admin: Address,
+        name: soroban_sdk::String,
+        symbol: soroban_sdk::String,
+        decimals: u32,
+    );
+    fn mint(env: Env, to: Address, amount: i128);
+    fn burn(env: Env, from: Address, amount: i128);
+    fn balance(env: Env, id: Address) -> i128;
+}
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
 

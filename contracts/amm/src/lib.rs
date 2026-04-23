@@ -357,7 +357,7 @@ impl AmmPool {
 
     /// Calculate the output amount for a hypothetical swap without executing it.
     ///
-    /// Applies the same constant-product formula and fee as [`Self::swap`] but
+    /// Applies the same constant-product formula and fee as `swap` but
     /// makes no state changes. Useful for quoting prices off-chain or in other
     /// contracts before committing to a swap.
     ///

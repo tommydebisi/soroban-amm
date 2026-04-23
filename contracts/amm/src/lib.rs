@@ -9,9 +9,7 @@
 
 #![no_std]
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, Symbol,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
 // Standard SEP-41 interface for pool tokens (token_a, token_b)
 use soroban_sdk::token::Client as SepTokenClient;
 // Our custom LP token client (has mint + burn)
@@ -27,13 +25,13 @@ pub enum DataKey {
     ReserveA,
     ReserveB,
     TotalShares,
-    Shares(Address),
     FeeBps, // fee in basis points, e.g. 30 = 0.30 %
 }
 
 // ── Pool info returned by `get_info` ─────────────────────────────────────────
 
 #[contracttype]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PoolInfo {
     pub token_a: Address,
     pub token_b: Address,
@@ -52,9 +50,22 @@ pub struct AmmPool;
 impl AmmPool {
     // ── Admin / Setup ─────────────────────────────────────────────────────────
 
-    /// Initialize the pool.
+    /// Initialize the AMM pool with two tokens, an LP token, and a swap fee.
     ///
-    /// `lp_token` must already be deployed and its admin set to this contract.
+    /// Must be called exactly once after deployment. The LP token contract must
+    /// already be deployed with this contract set as its admin so it can mint
+    /// and burn shares on behalf of liquidity providers.
+    ///
+    /// # Parameters
+    /// - `token_a` – Address of the first pool token (SEP-41 compliant).
+    /// - `token_b` – Address of the second pool token (SEP-41 compliant).
+    /// - `lp_token` – Address of the LP token contract used to represent pool shares.
+    /// - `fee_bps` – Swap fee in basis points (e.g. `30` = 0.30 %). Must be in `[0, 10_000]`.
+    ///
+    /// # Panics
+    /// - If the pool has already been initialized.
+    /// - If `token_a == token_b`.
+    /// - If `fee_bps` is outside the range `[0, 10_000]`.
     pub fn initialize(
         env: Env,
         token_a: Address,
@@ -63,10 +74,19 @@ impl AmmPool {
         fee_bps: i128, // recommended: 30 (0.30 %)
     ) {
         if env.storage().instance().has(&DataKey::TokenA) {
-            panic!("already initialized");
+            panic!(
+                "already initialized: contract {:?}",
+                env.current_contract_address()
+            );
         }
-        assert!(token_a != token_b, "tokens must differ");
-        assert!(fee_bps >= 0 && fee_bps <= 10_000, "invalid fee");
+        assert!(
+            token_a != token_b,
+            "tokens must differ: token_a={token_a:?}, token_b={token_b:?}"
+        );
+        assert!(
+            (0..=10_000).contains(&fee_bps),
+            "invalid fee: {fee_bps} is outside 0..=10_000"
+        );
 
         env.storage().instance().set(&DataKey::TokenA, &token_a);
         env.storage().instance().set(&DataKey::TokenB, &token_b);
@@ -79,11 +99,29 @@ impl AmmPool {
 
     // ── Liquidity ─────────────────────────────────────────────────────────────
 
-    /// Deposit `amount_a` of token_a and `amount_b` of token_b.
+    /// Deposit tokens into the pool and receive LP shares in return.
     ///
-    /// On the first deposit any ratio is accepted. Subsequent deposits must
-    /// match the current pool ratio (within rounding); excess is *not* refunded
-    /// automatically — callers should compute amounts off-chain first.
+    /// On the first deposit any ratio is accepted and the initial share supply is
+    /// set to the geometric mean of the two amounts. Subsequent deposits must
+    /// match the current pool ratio (within integer rounding); excess tokens are
+    /// **not** refunded automatically — callers should compute amounts off-chain
+    /// before calling.
+    ///
+    /// Requires `provider` to have authorized this call.
+    ///
+    /// # Parameters
+    /// - `provider` – Address of the liquidity provider funding the deposit.
+    /// - `amount_a` – Amount of `token_a` to deposit. Must be positive.
+    /// - `amount_b` – Amount of `token_b` to deposit. Must be positive.
+    /// - `min_shares` – Minimum number of LP shares the caller is willing to
+    ///   receive; the transaction panics if fewer would be minted (slippage guard).
+    ///
+    /// # Returns
+    /// The number of LP shares minted to `provider`.
+    ///
+    /// # Panics
+    /// - If either `amount_a` or `amount_b` is not positive.
+    /// - If the shares that would be minted are less than `min_shares`.
     pub fn add_liquidity(
         env: Env,
         provider: Address,
@@ -92,7 +130,10 @@ impl AmmPool {
         min_shares: i128,
     ) -> i128 {
         provider.require_auth();
-        assert!(amount_a > 0 && amount_b > 0, "amounts must be positive");
+        assert!(
+            amount_a > 0 && amount_b > 0,
+            "amounts must be positive: amount_a={amount_a}, amount_b={amount_b}"
+        );
 
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
@@ -119,7 +160,14 @@ impl AmmPool {
             shares_a.min(shares_b)
         };
 
-        assert!(shares >= min_shares, "slippage: insufficient shares minted");
+        assert!(
+            shares > 0,
+            "amounts too small: computed shares would be zero"
+        );
+        assert!(
+            shares >= min_shares,
+            "slippage: insufficient shares minted: computed={shares}, minimum={min_shares}"
+        );
 
         // Update reserves.
         env.storage()
@@ -131,12 +179,6 @@ impl AmmPool {
         env.storage()
             .instance()
             .set(&DataKey::TotalShares, &(total_shares + shares));
-
-        // Credit LP shares.
-        let prev = Self::shares_of(env.clone(), provider.clone());
-        env.storage()
-            .persistent()
-            .set(&DataKey::Shares(provider.clone()), &(prev + shares));
 
         // Mint LP tokens.
         let lp_client = LpTokenClient::new(&env, &lp_token);
@@ -150,7 +192,32 @@ impl AmmPool {
         shares
     }
 
-    /// Burn `shares` LP tokens and receive back a proportional amount of each token.
+    /// Withdraw liquidity from the pool by burning LP shares.
+    ///
+    /// Burns exactly `shares` LP tokens held by `provider` and transfers a
+    /// proportional amount of both pool tokens back to the provider. The
+    /// proportion is `shares / total_shares` at the time of the call.
+    ///
+    /// Requires `provider` to have authorized this call.
+    ///
+    /// # Parameters
+    /// - `provider` – Address of the liquidity provider redeeming shares.
+    /// - `shares` – Number of LP shares to burn. Must be positive and ≤ the
+    ///   provider's current balance.
+    /// - `min_a` – Minimum amount of `token_a` the caller is willing to receive
+    ///   (slippage guard).
+    /// - `min_b` – Minimum amount of `token_b` the caller is willing to receive
+    ///   (slippage guard).
+    ///
+    /// # Returns
+    /// A tuple `(amount_a, amount_b)` — the token amounts transferred back to
+    /// the provider.
+    ///
+    /// # Panics
+    /// - If `shares` is not positive.
+    /// - If `provider` owns fewer shares than `shares`.
+    /// - If the computed `token_a` output would be less than `min_a`.
+    /// - If the computed `token_b` output would be less than `min_b`.
     pub fn remove_liquidity(
         env: Env,
         provider: Address,
@@ -159,10 +226,13 @@ impl AmmPool {
         min_b: i128,
     ) -> (i128, i128) {
         provider.require_auth();
-        assert!(shares > 0, "shares must be positive");
+        assert!(shares > 0, "shares must be positive: got {shares}");
 
         let owned = Self::shares_of(env.clone(), provider.clone());
-        assert!(owned >= shares, "insufficient LP shares");
+        assert!(
+            owned >= shares,
+            "insufficient LP shares: owned={owned}, requested={shares}"
+        );
 
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
@@ -175,8 +245,14 @@ impl AmmPool {
         let out_a = shares * reserve_a / total_shares;
         let out_b = shares * reserve_b / total_shares;
 
-        assert!(out_a >= min_a, "slippage: insufficient token_a out");
-        assert!(out_b >= min_b, "slippage: insufficient token_b out");
+        assert!(
+            out_a >= min_a,
+            "slippage: insufficient token_a out: got={out_a}, min={min_a}"
+        );
+        assert!(
+            out_b >= min_b,
+            "slippage: insufficient token_b out: got={out_b}, min={min_b}"
+        );
 
         // Burn LP tokens.
         let lp_client = LpTokenClient::new(&env, &lp_token);
@@ -192,9 +268,6 @@ impl AmmPool {
         env.storage()
             .instance()
             .set(&DataKey::TotalShares, &(total_shares - shares));
-        env.storage()
-            .persistent()
-            .set(&DataKey::Shares(provider.clone()), &(owned - shares));
 
         // Return tokens.
         let client_a = SepTokenClient::new(&env, &token_a);
@@ -212,9 +285,32 @@ impl AmmPool {
 
     // ── Swap ──────────────────────────────────────────────────────────────────
 
-    /// Swap an exact `amount_in` of `token_in` for at least `min_out` of the other token.
+    /// Swap an exact amount of one pool token for the other.
     ///
-    /// Uses the constant-product formula with fee deducted from `amount_in`.
+    /// Transfers `amount_in` of `token_in` from `trader` into the pool and
+    /// sends back the calculated output amount of the opposite token, computed
+    /// via the constant-product formula `x * y = k` with the pool fee deducted
+    /// from `amount_in` before the calculation.
+    ///
+    /// Requires `trader` to have authorized this call.
+    ///
+    /// # Parameters
+    /// - `trader` – Address of the account initiating the swap.
+    /// - `token_in` – Address of the token being sold; must be either `token_a`
+    ///   or `token_b` of this pool.
+    /// - `amount_in` – Exact amount of `token_in` to sell. Must be positive.
+    /// - `min_out` – Minimum amount of the output token the caller is willing to
+    ///   accept (slippage guard).
+    ///
+    /// # Returns
+    /// The amount of the output token transferred to `trader`.
+    ///
+    /// # Panics
+    /// - If `amount_in` is not positive.
+    /// - If `token_in` is not one of the two pool tokens.
+    /// - If either pool reserve is zero (pool is empty).
+    /// - If the computed output would be less than `min_out`.
+    /// - If the computed output equals or exceeds the output reserve (insufficient liquidity).
     pub fn swap(
         env: Env,
         trader: Address,
@@ -223,20 +319,31 @@ impl AmmPool {
         min_out: i128,
     ) -> i128 {
         trader.require_auth();
-        assert!(amount_in > 0, "amount_in must be positive");
+        assert!(amount_in > 0, "amount_in must be positive: got {amount_in}");
 
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
 
         let (reserve_in, reserve_out, token_out) = if token_in == token_a {
-            (Self::get_reserve_a(env.clone()), Self::get_reserve_b(env.clone()), token_b.clone())
+            (
+                Self::get_reserve_a(env.clone()),
+                Self::get_reserve_b(env.clone()),
+                token_b.clone(),
+            )
         } else if token_in == token_b {
-            (Self::get_reserve_b(env.clone()), Self::get_reserve_a(env.clone()), token_a.clone())
+            (
+                Self::get_reserve_b(env.clone()),
+                Self::get_reserve_a(env.clone()),
+                token_a.clone(),
+            )
         } else {
-            panic!("token_in is not part of this pool");
+            panic!("token_in is not part of this pool: {token_in:?}");
         };
 
-        assert!(reserve_in > 0 && reserve_out > 0, "pool is empty");
+        assert!(
+            reserve_in > 0 && reserve_out > 0,
+            "pool is empty: reserve_in={reserve_in}, reserve_out={reserve_out}"
+        );
 
         let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
 
@@ -246,8 +353,14 @@ impl AmmPool {
         let amount_out =
             amount_in_with_fee * reserve_out / (reserve_in * 10_000 + amount_in_with_fee);
 
-        assert!(amount_out >= min_out, "slippage: insufficient output amount");
-        assert!(amount_out < reserve_out, "insufficient liquidity");
+        assert!(
+            amount_out >= min_out,
+            "slippage: insufficient output amount: got={amount_out}, min={min_out}"
+        );
+        assert!(
+            amount_out < reserve_out,
+            "insufficient liquidity: amount_out={amount_out} >= reserve_out={reserve_out}"
+        );
 
         // Transfer in.
         let client_in = SepTokenClient::new(&env, &token_in);
@@ -284,20 +397,46 @@ impl AmmPool {
 
     // ── Quotes (read-only) ────────────────────────────────────────────────────
 
-    /// Quote how much `token_out` you receive for `amount_in` of `token_in`.
+    /// Calculate the output amount for a hypothetical swap without executing it.
+    ///
+    /// Applies the same constant-product formula and fee as `swap` but
+    /// makes no state changes. Useful for quoting prices off-chain or in other
+    /// contracts before committing to a swap.
+    ///
+    /// # Parameters
+    /// - `token_in` – Address of the token being sold; must be either `token_a`
+    ///   or `token_b` of this pool.
+    /// - `amount_in` – Hypothetical amount of `token_in` to sell.
+    ///
+    /// # Returns
+    /// The amount of the output token that would be received for `amount_in`,
+    /// after the pool fee is applied.
+    ///
+    /// # Panics
+    /// - If `token_in` is not one of the two pool tokens.
     pub fn get_amount_out(env: Env, token_in: Address, amount_in: i128) -> i128 {
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
         let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
 
         let (reserve_in, reserve_out) = if token_in == token_a {
-            (Self::get_reserve_a(env.clone()), Self::get_reserve_b(env.clone()))
+            (
+                Self::get_reserve_a(env.clone()),
+                Self::get_reserve_b(env.clone()),
+            )
         } else if token_in == token_b {
-            (Self::get_reserve_b(env.clone()), Self::get_reserve_a(env.clone()))
+            (
+                Self::get_reserve_b(env.clone()),
+                Self::get_reserve_a(env.clone()),
+            )
         } else {
-            panic!("unknown token");
+            panic!("unknown token_in: {token_in:?}");
         };
 
+        assert!(
+            reserve_in > 0 && reserve_out > 0,
+            "pool is empty: reserve_in={reserve_in}, reserve_out={reserve_out}"
+        );
         let amount_in_with_fee = amount_in * (10_000 - fee_bps);
         amount_in_with_fee * reserve_out / (reserve_in * 10_000 + amount_in_with_fee)
     }
@@ -325,6 +464,16 @@ impl AmmPool {
     }
 
     /// Return full pool state.
+    /// Return a snapshot of the full pool state.
+    ///
+    /// This is a read-only view function; it makes no state changes.
+    ///
+    /// # Returns
+    /// A [`PoolInfo`] struct containing:
+    /// - `token_a` / `token_b` — addresses of the two pool tokens.
+    /// - `reserve_a` / `reserve_b` — current token reserves held by the pool.
+    /// - `total_shares` — total outstanding LP shares.
+    /// - `fee_bps` — the swap fee in basis points.
     pub fn get_info(env: Env) -> PoolInfo {
         PoolInfo {
             token_a: env.storage().instance().get(&DataKey::TokenA).unwrap(),
@@ -336,31 +485,48 @@ impl AmmPool {
         }
     }
 
+    /// Return the number of LP shares currently held by a given provider.
+    ///
+    /// This is a read-only view function; it makes no state changes.
+    ///
+    /// # Parameters
+    /// - `provider` – Address of the liquidity provider to query.
+    ///
+    /// # Returns
+    /// The LP share balance of `provider`, or `0` if the address has never
+    /// provided liquidity to this pool.
     pub fn shares_of(env: Env, provider: Address) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Shares(provider))
-            .unwrap_or(0)
+        let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();
+        LpTokenClient::new(&env, &lp_token).balance(&provider)
     }
 
     // ── Internals ─────────────────────────────────────────────────────────────
 
     fn get_reserve_a(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey::ReserveA).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&DataKey::ReserveA)
+            .unwrap_or(0)
     }
 
     fn get_reserve_b(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey::ReserveB).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&DataKey::ReserveB)
+            .unwrap_or(0)
     }
 
     fn get_total_shares(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalShares)
+            .unwrap_or(0)
     }
 
     /// Integer square root via Newton's method.
     fn sqrt(n: i128) -> i128 {
         if n < 0 {
-            panic!("sqrt of negative");
+            panic!("sqrt of negative: {n}");
         }
         if n == 0 {
             return 0;
@@ -387,7 +553,6 @@ mod tests {
     };
     use token::LpToken;
 
-    /// Register a Stellar Asset Contract and return (TokenClient, StellarAssetClient).
     fn create_sac<'a>(
         env: &'a Env,
         admin: &Address,
@@ -399,43 +564,69 @@ mod tests {
         )
     }
 
-    fn setup() -> (Env, Address, Address, Address, Address) {
+    struct TestSetup {
+        env: Env,
+        amm_addr: Address,
+        lp_addr: Address,
+        ta_addr: Address,
+        tb_addr: Address,
+        #[allow(dead_code)]
+        admin: Address,
+    }
+
+    fn setup_pool(fee_bps: i128) -> TestSetup {
         let env = Env::default();
         env.mock_all_auths();
 
         let admin = Address::generate(&env);
         let amm_addr = env.register_contract(None, AmmPool);
-
-        // LP token: custom contract, admin = AMM so it can mint/burn
         let lp_addr = env.register_contract(None, LpToken);
-        let lp_init = token::LpTokenClient::new(&env, &lp_addr);
-        lp_init.initialize(
+
+        token::LpTokenClient::new(&env, &lp_addr).initialize(
             &amm_addr,
             &soroban_sdk::String::from_str(&env, "AMM LP Token"),
             &soroban_sdk::String::from_str(&env, "ALP"),
             &7u32,
         );
 
-        (env, admin.clone(), amm_addr, lp_addr, admin)
+        let (ta, ta_sac) = create_sac(&env, &admin);
+        let (tb, tb_sac) = create_sac(&env, &admin);
+
+        AmmPoolClient::new(&env, &amm_addr).initialize(
+            &ta.address,
+            &tb.address,
+            &lp_addr,
+            &fee_bps,
+        );
+
+        let ta_addr = ta.address.clone();
+        let tb_addr = tb.address.clone();
+        drop((ta, ta_sac, tb, tb_sac));
+
+        TestSetup {
+            env,
+            amm_addr,
+            lp_addr,
+            ta_addr,
+            tb_addr,
+            admin,
+        }
     }
+
+    // ── Initialization ────────────────────────────────────────────────────────
 
     #[test]
     fn test_add_and_swap() {
-        let (env, admin, amm_addr, lp_addr, _) = setup();
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
 
-        // Pool tokens: use SAC for easy minting in tests
-        let (ta_client, ta_sac) = create_sac(&env, &admin);
-        let (tb_client, tb_sac) = create_sac(&env, &admin);
-
-        let amm = AmmPoolClient::new(&env, &amm_addr);
-        amm.initialize(&ta_client.address, &tb_client.address, &lp_addr, &30_i128);
-
-        // Mint tokens to provider
-        let provider = Address::generate(&env);
+        let provider = Address::generate(env);
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &2_000_000_i128);
 
-        // Add initial liquidity
         let shares = amm.add_liquidity(&provider, &1_000_000_i128, &2_000_000_i128, &0_i128);
         assert!(shares > 0);
 
@@ -443,36 +634,240 @@ mod tests {
         assert_eq!(info.reserve_a, 1_000_000);
         assert_eq!(info.reserve_b, 2_000_000);
 
-        // Swap 100_000 A → B
-        let trader = Address::generate(&env);
+        let trader = Address::generate(env);
         ta_sac.mint(&trader, &100_000_i128);
-
-        let out = amm.swap(&trader, &ta_client.address, &100_000_i128, &0_i128);
+        let out = amm.swap(&trader, &ts.ta_addr, &100_000_i128, &0_i128);
         assert!(out > 0);
-        assert!(out < 200_000); // slightly less than 2x due to fee + price impact
+        assert!(out < 200_000);
     }
 
     #[test]
     fn test_remove_liquidity() {
-        let (env, admin, amm_addr, lp_addr, _) = setup();
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
 
-        let (ta_client, ta_sac) = create_sac(&env, &admin);
-        let (tb_client, tb_sac) = create_sac(&env, &admin);
-
-        let amm = AmmPoolClient::new(&env, &amm_addr);
-        amm.initialize(&ta_client.address, &tb_client.address, &lp_addr, &30_i128);
-
-        let provider = Address::generate(&env);
+        let provider = Address::generate(env);
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
 
         let shares = amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
-
         let (out_a, out_b) = amm.remove_liquidity(&provider, &shares, &0_i128, &0_i128);
         assert!(out_a > 0 && out_b > 0);
+        assert_eq!(amm.get_info().total_shares, 0);
+    }
+
+    #[test]
+    fn test_initialize_twice_panics() {
+        let ts = setup_pool(30);
+        let amm = AmmPoolClient::new(&ts.env, &ts.amm_addr);
+        let result = amm.try_initialize(&ts.ta_addr, &ts.tb_addr, &ts.lp_addr, &30_i128);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_invalid_fee_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let amm_addr = env.register_contract(None, AmmPool);
+        let lp_addr = env.register_contract(None, LpToken);
+        token::LpTokenClient::new(&env, &lp_addr).initialize(
+            &amm_addr,
+            &soroban_sdk::String::from_str(&env, "LP"),
+            &soroban_sdk::String::from_str(&env, "LP"),
+            &7u32,
+        );
+        let (ta, _) = create_sac(&env, &admin);
+        let (tb, _) = create_sac(&env, &admin);
+        let result = AmmPoolClient::new(&env, &amm_addr).try_initialize(
+            &ta.address,
+            &tb.address,
+            &lp_addr,
+            &10_001_i128,
+        );
+        assert!(result.is_err());
+    }
+
+    // ── Swap ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_swap_b_to_a() {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+
+        let trader = Address::generate(env);
+        tb_sac.mint(&trader, &100_000_i128);
+        let out = amm.swap(&trader, &ts.tb_addr, &100_000_i128, &0_i128);
+        assert!(out > 0 && out < 100_000);
 
         let info = amm.get_info();
-        assert_eq!(info.total_shares, 0);
+        assert_eq!(info.reserve_b, 1_100_000);
+        assert_eq!(info.reserve_a, 1_000_000 - out);
+    }
+
+    #[test]
+    fn test_swap_slippage_panics() {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+
+        let trader = Address::generate(env);
+        ta_sac.mint(&trader, &100_000_i128);
+        let result = amm.try_swap(&trader, &ts.ta_addr, &100_000_i128, &200_000_i128);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_fee_accrues_to_reserves() {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+
+        let trader = Address::generate(env);
+        let amount_in = 100_000_i128;
+        ta_sac.mint(&trader, &amount_in);
+        let out = amm.swap(&trader, &ts.ta_addr, &amount_in, &0_i128);
+
+        let info = amm.get_info();
+        assert_eq!(info.reserve_a, 1_000_000 + amount_in);
+        assert_eq!(info.reserve_b, 1_000_000 - out);
+        // k must grow because fee stays in pool
+        assert!(info.reserve_a * info.reserve_b > 1_000_000 * 1_000_000);
+    }
+
+    // ── Liquidity ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_add_liquidity_slippage_panics() {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        let result = amm.try_add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &i128::MAX);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_remove_liquidity_slippage_panics() {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        let shares = amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+        let result = amm.try_remove_liquidity(&provider, &shares, &i128::MAX, &0_i128);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lp_token_transfer_enables_remove() {
+        // Verify fix: LP token is the single source of truth for share ownership.
+        // Before fix, AMM had a stale internal Shares map that didn't update on transfers.
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let lp = token::LpTokenClient::new(env, &ts.lp_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        let shares = amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+
+        let recipient = Address::generate(env);
+        lp.transfer(&provider, &recipient, &shares);
+
+        assert_eq!(amm.shares_of(&provider), 0);
+        assert_eq!(amm.shares_of(&recipient), shares);
+
+        let (out_a, out_b) = amm.remove_liquidity(&recipient, &shares, &0_i128, &0_i128);
+        assert!(out_a > 0 && out_b > 0);
+        assert_eq!(amm.get_info().total_shares, 0);
+    }
+
+    #[test]
+    fn test_multiple_lps() {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        let lp1 = Address::generate(env);
+        ta_sac.mint(&lp1, &1_000_000_i128);
+        tb_sac.mint(&lp1, &1_000_000_i128);
+        let shares1 = amm.add_liquidity(&lp1, &1_000_000_i128, &1_000_000_i128, &0_i128);
+
+        let lp2 = Address::generate(env);
+        ta_sac.mint(&lp2, &500_000_i128);
+        tb_sac.mint(&lp2, &500_000_i128);
+        let shares2 = amm.add_liquidity(&lp2, &500_000_i128, &500_000_i128, &0_i128);
+
+        assert_eq!(amm.get_info().total_shares, shares1 + shares2);
+
+        amm.remove_liquidity(&lp1, &shares1, &0_i128, &0_i128);
+        amm.remove_liquidity(&lp2, &shares2, &0_i128, &0_i128);
+        assert_eq!(amm.get_info().total_shares, 0);
+    }
+
+    // ── Quotes ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_amount_out_matches_swap() {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+
+        let amount_in = 50_000_i128;
+        let quoted = amm.get_amount_out(&ts.ta_addr, &amount_in);
+
+        let trader = Address::generate(env);
+        ta_sac.mint(&trader, &amount_in);
+        let actual = amm.swap(&trader, &ts.ta_addr, &amount_in, &0_i128);
+
+        assert_eq!(quoted, actual);
     }
 
     #[test]

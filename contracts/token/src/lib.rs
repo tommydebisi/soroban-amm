@@ -24,13 +24,7 @@ impl LpToken {
     ///
     /// `admin` is the only address authorized to call `mint` and `burn`.
     /// Panics if the contract has already been initialized.
-    pub fn initialize(
-        env: Env,
-        admin: Address,
-        name: String,
-        symbol: String,
-        decimals: u32,
-    ) {
+    pub fn initialize(env: Env, admin: Address, name: String, symbol: String, decimals: u32) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic!(
                 "already initialized: contract {:?}",

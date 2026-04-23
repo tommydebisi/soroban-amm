@@ -9,7 +9,9 @@
 
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol,
+};
 // Standard SEP-41 interface for pool tokens (token_a, token_b)
 use soroban_sdk::token::Client as SepTokenClient;
 
@@ -292,8 +294,8 @@ impl AmmPool {
         client_b.transfer(&env.current_contract_address(), &provider, &out_b);
 
         env.events().publish(
-            (Symbol::new(&env, "remove_liquidity"), provider),
-            (out_a, out_b, shares),
+            (symbol_short!("rm_liq"),),
+            (provider.clone(), shares, out_a, out_b),
         );
 
         (out_a, out_b)
@@ -457,6 +459,29 @@ impl AmmPool {
         amount_in_with_fee * reserve_out / (reserve_in * 10_000 + amount_in_with_fee)
     }
 
+    /// Quote how much `token_in` is required to receive exactly `amount_out` of `token_out`.
+    pub fn get_amount_in(env: Env, token_out: Address, amount_out: i128) -> i128 {
+        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
+        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
+
+        let (reserve_in, reserve_out) = if token_out == token_a {
+            (Self::get_reserve_b(env.clone()), Self::get_reserve_a(env.clone()))
+        } else if token_out == token_b {
+            (Self::get_reserve_a(env.clone()), Self::get_reserve_b(env.clone()))
+        } else {
+            panic!("unknown token");
+        };
+
+        assert!(reserve_in > 0 && reserve_out > 0, "zero reserve");
+        assert!(amount_out < reserve_out, "amount_out >= reserve_out");
+
+        (reserve_in * amount_out * 10_000)
+            / ((reserve_out - amount_out) * (10_000 - fee_bps))
+            + 1
+    }
+
+    /// Return full pool state.
     /// Return a snapshot of the full pool state.
     ///
     /// This is a read-only view function; it makes no state changes.
@@ -917,5 +942,71 @@ mod tests {
 
         // Final k should be strictly greater than initial k because of fees
         assert!(current_k > initial_k);
+    fn test_get_amount_in_round_trip() {
+        let (env, admin, amm_addr, lp_addr, _) = setup();
+
+        let (ta_client, ta_sac) = create_sac(&env, &admin);
+        let (tb_client, tb_sac) = create_sac(&env, &admin);
+
+        let amm = AmmPoolClient::new(&env, &amm_addr);
+        amm.initialize(&ta_client.address, &tb_client.address, &lp_addr, &30_i128);
+
+        let provider = Address::generate(&env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &2_000_000_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &2_000_000_i128, &0_i128);
+
+        // Forward: how much B do we get for 100_000 A?
+        let amount_in = 100_000_i128;
+        let amount_out = amm.get_amount_out(&ta_client.address, &amount_in);
+        assert!(amount_out > 0);
+
+        // Reverse: how much A is needed to get exactly amount_out of B?
+        let amount_in_reverse = amm.get_amount_in(&tb_client.address, &amount_out);
+
+        // Due to integer rounding (+1 in get_amount_in), the reverse quote
+        // should be >= the original input and at most 1 unit more.
+        assert!(
+            amount_in_reverse >= amount_in,
+            "reverse quote should be >= original input"
+        );
+        assert!(
+            amount_in_reverse <= amount_in + 1,
+            "reverse quote should be at most 1 unit above original input"
+        );
+    }
+
+    #[test]
+    fn test_remove_liquidity_emits_event() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::{symbol_short, vec, IntoVal};
+
+        let (env, admin, amm_addr, lp_addr, _) = setup();
+
+        let (ta_client, ta_sac) = create_sac(&env, &admin);
+        let (tb_client, tb_sac) = create_sac(&env, &admin);
+
+        let amm = AmmPoolClient::new(&env, &amm_addr);
+        amm.initialize(&ta_client.address, &tb_client.address, &lp_addr, &30_i128);
+
+        let provider = Address::generate(&env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+
+        let shares = amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+        let (out_a, out_b) = amm.remove_liquidity(&provider, &shares, &0_i128, &0_i128);
+
+        // Find the rm_liq event among all published events
+        let events = env.events().all();
+        let rm_liq_event = events.iter().find(|(_, topics, _)| {
+            topics == &vec![&env, symbol_short!("rm_liq").into_val(&env)]
+        });
+
+        assert!(rm_liq_event.is_some(), "rm_liq event not emitted");
+
+        let (_, _, data) = rm_liq_event.unwrap();
+        let expected: soroban_sdk::Val =
+            (provider.clone(), shares, out_a, out_b).into_val(&env);
+        assert_eq!(data, expected);
     }
 }
